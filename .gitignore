@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Internal / dev notes — keep out of public repo
+*Session Notes*
+*session-notes*
+NOTES.local.md
+TODO.local.md
+
+# Sample / test PBIP folders that users may drop in for local testing
+*.SemanticModel/
+*.Report/
+My new report*/
+My new report*.json
+
+# Build artifacts (none today, future-proof)
+dist/
+node_modules/
