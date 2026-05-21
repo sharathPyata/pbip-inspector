@@ -1,6 +1,6 @@
 # PBIP Inspector
 
-A self-contained HTML tool for exploring **Power BI Project (PBIP)** folders. Drop a PBIP folder into the browser and everything is parsed and rendered locally.
+A self-contained HTML **viewer, explorer, and analyzer** for **Power BI Project (PBIP)** folders. Drop a PBIP folder into the browser and the tool parses TMDL, reads DAX, explores M code, draws relationships, and flags unused fields — all locally, no upload.
 
 **No network calls. No uploads. No backend.** Open the HTML file, drop your folder, and inspect.
 
