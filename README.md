@@ -8,6 +8,61 @@ A self-contained HTML tool for exploring **Power BI Project (PBIP)** folders. Dr
 
 ---
 
+## Screenshots
+
+<table>
+<tr>
+<td width="50%" align="center">
+<b>Drag-and-drop home</b><br>
+<img src="screenshots/DefaultHome.png" alt="Empty state — drop a PBIP folder">
+</td>
+<td width="50%" align="center">
+<b>Overview</b><br>
+<img src="screenshots/Overview.png" alt="Overview tab — tiles, model metadata, sources">
+</td>
+</tr>
+<tr>
+<td width="50%" align="center">
+<b>Sources</b><br>
+<img src="screenshots/Sources.png" alt="Sources tab — grouped by host">
+</td>
+<td width="50%" align="center">
+<b>Tables</b><br>
+<img src="screenshots/Tables.png" alt="Tables tab — master-detail browser, grouped by source">
+</td>
+</tr>
+<tr>
+<td width="50%" align="center">
+<b>Measures</b><br>
+<img src="screenshots/Measures.png" alt="Measures tab — searchable DAX">
+</td>
+<td width="50%" align="center">
+<b>Relationships</b><br>
+<img src="screenshots/Relationships.png" alt="Relationships tab — force-directed graph">
+</td>
+</tr>
+<tr>
+<td width="50%" align="center">
+<b>Pages</b><br>
+<img src="screenshots/Pages.png" alt="Pages tab — visuals + field/measure search">
+</td>
+<td width="50%" align="center">
+<b>Unused</b><br>
+<img src="screenshots/Unused.png" alt="Unused tab — columns and measures with no references">
+</td>
+</tr>
+<tr>
+<td align="center" colspan="2">
+<b>Notes</b><br>
+<img src="screenshots/Notes.png" alt="Notes tab — self-documenting reference" width="50%">
+</td>
+</tr>
+</table>
+
+*(Screenshots use Microsoft's public AdventureWorks PBIP sample.)*
+
+---
+
 ## Quick start
 
 1. Open `PBIP Inspector.html` in a modern browser (Chrome / Edge 113+, Firefox 113+, or Safari 16.4+).
