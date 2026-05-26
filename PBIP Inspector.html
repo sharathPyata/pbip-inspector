@@ -1989,6 +1989,147 @@ function parseReport(text) {
   });
 }
 
+/* Parse a PBIR (Power BI Enhanced Report) report from per-file JSONs.
+   Returns { pages, references } — same `pages` shape as parseReport() returns + the
+   reportReferences Set. PBIR layout (new since 2025):
+
+     .Report/
+       definition.pbir                       (top-level marker, references the semantic model)
+       definition/
+         report.json                         (report-level config — NOT the legacy report.json)
+         pages/
+           pages.json                        (page order, active page)
+           [pageName]/
+             page.json                       (page metadata)
+             visuals/
+               [visualName]/
+                 visual.json                 (per-visual: type, position, query bindings)
+                 mobile.json                 (optional mobile layout)
+
+   Microsoft docs:
+     https://learn.microsoft.com/en-us/power-bi/developer/projects/projects-report
+   JSON schemas:
+     https://github.com/microsoft/json-schemas/tree/main/fabric/item/report/definition
+*/
+async function parsePbirReport(byPath, pagesJsonKey) {
+  // pagesJsonKey: ".../<Project>.Report/definition/pages/pages.json"
+  const pagesRoot = pagesJsonKey.replace(/\/pages\.json$/, '');
+  const allText = [];  // every JSON file's text — fed to extractAllReportReferences at the end
+
+  // 1. Page order from pages.json (when present)
+  let pagesJson = {};
+  try {
+    const t = await byPath[pagesJsonKey].text();
+    allText.push(t);
+    pagesJson = JSON.parse(t);
+  } catch (e) {}
+  let pageNames = Array.isArray(pagesJson.pageOrder) ? pagesJson.pageOrder.slice() : [];
+
+  // 2. Fallback — infer page list from filesystem if pages.json was empty/missing
+  if (!pageNames.length) {
+    const re = new RegExp('^' + escRe(pagesRoot + '/') + '([^/]+)/page\\.json$');
+    for (const k of Object.keys(byPath)) {
+      const m = k.match(re);
+      if (m && !pageNames.includes(m[1])) pageNames.push(m[1]);
+    }
+  }
+
+  // 3. For each page, read page.json + walk visuals/*/visual.json
+  const pages = [];
+  for (const pageName of pageNames) {
+    const pageJsonKey = `${pagesRoot}/${pageName}/page.json`;
+    if (!byPath[pageJsonKey]) continue;
+    let pageJson;
+    try {
+      const t = await byPath[pageJsonKey].text();
+      allText.push(t);
+      pageJson = JSON.parse(t);
+    } catch (e) { continue; }
+
+    const visualPrefix = `${pagesRoot}/${pageName}/visuals/`;
+    const visualKeys = Object.keys(byPath).filter(k =>
+      k.startsWith(visualPrefix) && k.endsWith('/visual.json'));
+    const visuals = [];
+    for (const vk of visualKeys) {
+      try {
+        const t = await byPath[vk].text();
+        allText.push(t);
+        visuals.push(parsePbirVisual(JSON.parse(t)));
+      } catch (e) {}
+    }
+
+    pages.push({
+      name: pageJson.name || pageName,
+      displayName: pageJson.displayName || pageJson.name || pageName,
+      width: Math.round(pageJson.width || 0),
+      height: Math.round(pageJson.height || 0),
+      visuals,
+    });
+  }
+
+  // 4. Reuse the existing report-references walker on the combined JSON text
+  const references = extractAllReportReferences(allText.join('\n'));
+  return { pages, references };
+}
+
+/* Parse a single PBIR visual.json into the same shape parseReport's visuals use. */
+function parsePbirVisual(vJson) {
+  const visual = (vJson && vJson.visual) || {};
+  const type = visual.visualType || 'unknown';
+
+  // Position: position.x / y / z / width / height / tabOrder
+  const pos = (vJson && vJson.position) || {};
+  const x = Math.round(pos.x || 0);
+  const y = Math.round(pos.y || 0);
+  const z = Math.round(pos.z || 0);
+  const width = Math.round(pos.width || 0);
+  const height = Math.round(pos.height || 0);
+  const tabOrder = pos.tabOrder ?? null;
+
+  // Field bindings: visual.query.queryState.[roleName].projections[].queryRef
+  const fields = [];
+  const queryState = (visual.query && visual.query.queryState) || {};
+  for (const role of Object.keys(queryState)) {
+    const projections = (queryState[role] && queryState[role].projections) || [];
+    for (const p of projections) {
+      const ref = p.queryRef || p.nativeQueryRef || pbirFieldToRef(p.field);
+      if (ref) fields.push({ role, ref });
+    }
+  }
+
+  return { type, fields, x, y, z, width, height, tabOrder };
+}
+
+/* Fallback: derive a "Entity.Property" string from a QueryExpressionContainer when the
+   visual didn't include a `queryRef`. Walks Column / Measure / Hierarchy / HierarchyLevel
+   wrappers down to {Property, Expression.SourceRef.Entity}. */
+function pbirFieldToRef(field) {
+  if (!field || typeof field !== 'object') return '';
+  const visit = (node) => {
+    if (!node || typeof node !== 'object') return null;
+    for (const kind of ['Column', 'Measure', 'Hierarchy', 'HierarchyLevel']) {
+      if (node[kind]) {
+        const inner = node[kind];
+        const prop = inner.Property || inner.Hierarchy || inner.Level;
+        const entity = (inner.Expression && inner.Expression.SourceRef && inner.Expression.SourceRef.Entity)
+                    || (inner.Expression && inner.Expression.Hierarchy && inner.Expression.Hierarchy.Expression
+                        && inner.Expression.Hierarchy.Expression.SourceRef && inner.Expression.Hierarchy.Expression.SourceRef.Entity);
+        if (entity && prop) return `${entity}.${prop}`;
+      }
+    }
+    if (node.Aggregation) return visit(node.Aggregation.Expression);
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (v && typeof v === 'object') {
+        const r = visit(v);
+        if (r) return r;
+      }
+    }
+    return null;
+  };
+  return visit(field) || '';
+}
+
 /* ═══════════════════════════════════════════════════════════════
    USAGE ANALYSIS
    ═══════════════════════════════════════════════════════════════ */
@@ -2328,10 +2469,15 @@ async function processFiles(fileList) {
   }
   App.state.sources = Object.values(sourcesByKey);
 
-  // Parse report
-  const reportKey = Object.keys(byPath).find(k => /\.Report\/report\.json$/.test(k));
-  if (reportKey) {
-    const text = await byPath[reportKey].text();
+  // Parse report — detect PBIR (per-file) first; fall back to PBIR-Legacy (single report.json)
+  const pbirPagesKey = Object.keys(byPath).find(k => /\.Report\/definition\/pages\/pages\.json$/.test(k));
+  const legacyKey = Object.keys(byPath).find(k => /\.Report\/report\.json$/.test(k));
+  if (pbirPagesKey) {
+    const { pages, references } = await parsePbirReport(byPath, pbirPagesKey);
+    App.state.pages = pages;
+    App.state.reportReferences = references;
+  } else if (legacyKey) {
+    const text = await byPath[legacyKey].text();
     App.state.pages = parseReport(text);
     App.state.reportReferences = extractAllReportReferences(text);
   } else {
@@ -3263,7 +3409,7 @@ function drawRelList() {
 function renderPages() {
   const c = App.els.pagesContent;
   if (!App.state.pages.length) {
-    c.innerHTML = '<div class="card" style="margin:24px"><div class="card-body" style="color:var(--text-3)">No report pages found (this PBIP may not have a <code>.Report/report.json</code> file in legacy format, or it uses the newer PBIR per-file format).</div></div>';
+    c.innerHTML = '<div class="card" style="margin:24px"><div class="card-body" style="color:var(--text-3)">No report pages found — this PBIP doesn\'t appear to have either a legacy <code>.Report/report.json</code> or a PBIR <code>.Report/definition/pages/</code> folder.</div></div>';
     return;
   }
   const hideUnbound = App.state.pagesHideUnbound || false;
@@ -3942,17 +4088,27 @@ function renderNotes() {
     </div>
 
     <h2>11. Report parsing (Pages tab)</h2>
+    <p>Two formats are supported, auto-detected at load time:</p>
+    <h3>11.1 PBIR-Legacy (single <code>report.json</code>)</h3>
     <ul>
-      <li>Reads <code>*.Report/report.json</code> (older single-file format)</li>
+      <li>Reads <code>*.Report/report.json</code></li>
       <li>Walks <code>sections[]</code> → pages, each with <code>visualContainers[]</code> → visuals</li>
       <li>Visual type from <code>config.singleVisual.visualType</code> (config is stringified JSON, parsed on the fly)</li>
       <li>Field bindings from <code>config.singleVisual.projections[role][].queryRef</code></li>
       <li>Dimensions (width/height) extracted for display</li>
     </ul>
+    <h3>11.2 PBIR (per-file, default for new reports since 2026)</h3>
+    <ul>
+      <li>Detected by presence of <code>*.Report/definition/pages/pages.json</code> (PBIR is preferred when both formats coexist)</li>
+      <li>Page order read from <code>pages.json → pageOrder[]</code>; if absent, all <code>[pageName]/page.json</code> files are discovered by scanning</li>
+      <li>Per-page metadata from <code>[pageName]/page.json</code> — <code>name</code>, <code>displayName</code>, <code>width</code>, <code>height</code></li>
+      <li>Each visual lives at <code>[pageName]/visuals/[visualName]/visual.json</code> — type from <code>visual.visualType</code>, position from <code>position.{x,y,z,width,height,tabOrder}</code>, field bindings from <code>visual.query.queryState.[role].projections[].queryRef</code> (falls back to walking <code>field</code> when <code>queryRef</code> is missing)</li>
+      <li>All visual + page JSON contents are concatenated and passed through the same reference walker used for the legacy format, so the Usage analyzer works identically across both</li>
+    </ul>
+    <p>Microsoft docs: <a href="https://learn.microsoft.com/en-us/power-bi/developer/projects/projects-report" target="_blank">PBIP Report folder</a> · <a href="https://github.com/microsoft/json-schemas/tree/main/fabric/item/report/definition" target="_blank">PBIR JSON schemas</a></p>
 
     <h2>12. Known limitations / TODO</h2>
     <ul>
-      <li><strong>PBIR format</strong> (newer per-file report format with one JSON per page/visual) not yet supported — only the legacy single <code>report.json</code> is parsed. Pages tab will be empty for PBIR projects.</li>
       <li><strong>Function definitions in M</strong> (<code>let f = (x) => ...</code>) — not traced as a source. A table that calls a custom function won't be classified.</li>
       <li><strong>Parameters / variables</strong> as SQL — if the SQL is built at runtime via <code>"SELECT * FROM " &amp; TableNameParam</code>, only the literal pieces are extracted.</li>
       <li><strong>RLS / row-level security roles</strong> — not surfaced.</li>

@@ -90,7 +90,7 @@ My report/
     └── report.json
 ```
 
-PBIP Inspector reads the `.SemanticModel/definition/*.tmdl` files for the data model and `.Report/report.json` for the report layout.
+PBIP Inspector reads the `.SemanticModel/definition/*.tmdl` files for the data model. Both report formats are auto-detected: the legacy single `.Report/report.json` and the newer **PBIR** per-file format (`.Report/definition/pages/[pageName]/visuals/[visualName]/visual.json`) introduced in 2026.
 
 ---
 
@@ -169,7 +169,6 @@ This means you can drop a PBIP that contains internal SQL, schema names, or sens
 
 ## Known limitations
 
-- **PBIR per-file report format** is not supported (each visual in its own JSON file). Only the legacy single-`report.json` format is read.
 - **Multi-line calculated-column DAX** (backtick-fenced or indented) is only partially captured — single-line definitions are fully read.
 - **KPI definitions, detail-rows expressions, formatStringDefinition DAX** are present in the model but not parsed for entity references.
 - **Translations and cultures** are present in TMDL but not surfaced.
