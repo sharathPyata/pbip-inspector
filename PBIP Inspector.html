@@ -1684,10 +1684,18 @@ function parseDaxReferences(dax) {
   filters, dataTransforms). The walker parses these recursively to find references
   inside.
 */
-function extractAllReportReferences(reportText) {
+function extractAllReportReferences(report) {
+  // Accepts either a JSON string (legacy report.json) or an already-parsed object
+  // (PBIR, where each visual.json / page.json is parsed individually — see parsePbirReport).
   const refs = new Set();
   let parsed;
-  try { parsed = JSON.parse(reportText); } catch (e) { return refs; }
+  if (typeof report === 'string') {
+    try { parsed = JSON.parse(report); } catch (e) { return refs; }
+  } else if (report && typeof report === 'object') {
+    parsed = report;
+  } else {
+    return refs;
+  }
 
   function resolveEntity(sourceRef, scopeMap) {
     if (!sourceRef || typeof sourceRef !== 'object') return null;
@@ -2014,14 +2022,14 @@ function parseReport(text) {
 async function parsePbirReport(byPath, pagesJsonKey) {
   // pagesJsonKey: ".../<Project>.Report/definition/pages/pages.json"
   const pagesRoot = pagesJsonKey.replace(/\/pages\.json$/, '');
-  const allText = [];  // every JSON file's text — fed to extractAllReportReferences at the end
+  const allJson = [];  // every parsed JSON file — each fed individually to extractAllReportReferences
 
   // 1. Page order from pages.json (when present)
   let pagesJson = {};
   try {
     const t = await byPath[pagesJsonKey].text();
-    allText.push(t);
     pagesJson = JSON.parse(t);
+    allJson.push(pagesJson);
   } catch (e) {}
   let pageNames = Array.isArray(pagesJson.pageOrder) ? pagesJson.pageOrder.slice() : [];
 
@@ -2042,8 +2050,8 @@ async function parsePbirReport(byPath, pagesJsonKey) {
     let pageJson;
     try {
       const t = await byPath[pageJsonKey].text();
-      allText.push(t);
       pageJson = JSON.parse(t);
+      allJson.push(pageJson);
     } catch (e) { continue; }
 
     const visualPrefix = `${pagesRoot}/${pageName}/visuals/`;
@@ -2053,8 +2061,9 @@ async function parsePbirReport(byPath, pagesJsonKey) {
     for (const vk of visualKeys) {
       try {
         const t = await byPath[vk].text();
-        allText.push(t);
-        visuals.push(parsePbirVisual(JSON.parse(t)));
+        const vJson = JSON.parse(t);
+        allJson.push(vJson);
+        visuals.push(parsePbirVisual(vJson));
       } catch (e) {}
     }
 
@@ -2067,8 +2076,15 @@ async function parsePbirReport(byPath, pagesJsonKey) {
     });
   }
 
-  // 4. Reuse the existing report-references walker on the combined JSON text
-  const references = extractAllReportReferences(allText.join('\n'));
+  // 4. Run the report-references walker on EACH parsed file and union the results.
+  //    Do NOT concatenate the file texts — multiple JSON documents joined together aren't
+  //    valid JSON, so a single JSON.parse would fail and silently return zero references
+  //    (which would falsely flag fields used only in filters / sort / conditional formatting
+  //    as "unused"). Passing each already-parsed object individually is the correct approach.
+  const references = new Set();
+  for (const obj of allJson) {
+    for (const r of extractAllReportReferences(obj)) references.add(r);
+  }
   return { pages, references };
 }
 
