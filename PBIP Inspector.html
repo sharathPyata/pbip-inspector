@@ -2019,12 +2019,13 @@ function parseReport(text) {
    JSON schemas:
      https://github.com/microsoft/json-schemas/tree/main/fabric/item/report/definition
 */
-async function parsePbirReport(byPath, pagesJsonKey) {
-  // pagesJsonKey: ".../<Project>.Report/definition/pages/pages.json"
-  const pagesRoot = pagesJsonKey.replace(/\/pages\.json$/, '');
+async function parsePbirReport(byPath, pagesRoot) {
+  // pagesRoot: ".../<Project>.Report/definition/pages" (the folder, not a specific file —
+  // pages.json is OPTIONAL per the PBIR spec, so we don't depend on it existing).
+  const pagesJsonKey = `${pagesRoot}/pages.json`;
   const allJson = [];  // every parsed JSON file — each fed individually to extractAllReportReferences
 
-  // 1. Page order from pages.json (when present)
+  // 1. Page order from pages.json (when present — optional)
   let pagesJson = {};
   try {
     const t = await byPath[pagesJsonKey].text();
@@ -2485,11 +2486,18 @@ async function processFiles(fileList) {
   }
   App.state.sources = Object.values(sourcesByKey);
 
-  // Parse report — detect PBIR (per-file) first; fall back to PBIR-Legacy (single report.json)
-  const pbirPagesKey = Object.keys(byPath).find(k => /\.Report\/definition\/pages\/pages\.json$/.test(k));
+  // Parse report — detect PBIR (per-file) first; fall back to PBIR-Legacy (single report.json).
+  // PBIR is detected by the definition/pages/ folder, identified via pages.json OR any
+  // [pageName]/page.json under it (pages.json is optional per the PBIR spec). We capture the
+  // pages-root folder path so parsePbirReport doesn't depend on pages.json existing.
+  let pbirPagesRoot = null;
+  for (const k of Object.keys(byPath)) {
+    const m = k.match(/^(.*\.Report\/definition\/pages)\/(?:pages\.json|[^/]+\/page\.json)$/);
+    if (m) { pbirPagesRoot = m[1]; break; }
+  }
   const legacyKey = Object.keys(byPath).find(k => /\.Report\/report\.json$/.test(k));
-  if (pbirPagesKey) {
-    const { pages, references } = await parsePbirReport(byPath, pbirPagesKey);
+  if (pbirPagesRoot) {
+    const { pages, references } = await parsePbirReport(byPath, pbirPagesRoot);
     App.state.pages = pages;
     App.state.reportReferences = references;
   } else if (legacyKey) {
@@ -4115,7 +4123,7 @@ function renderNotes() {
     </ul>
     <h3>11.2 PBIR (per-file, default for new reports since 2026)</h3>
     <ul>
-      <li>Detected by presence of <code>*.Report/definition/pages/pages.json</code> (PBIR is preferred when both formats coexist)</li>
+      <li>Detected by the <code>*.Report/definition/pages/</code> folder — identified via <code>pages.json</code> OR any <code>[pageName]/page.json</code> under it, since <code>pages.json</code> is optional per the spec (PBIR is preferred when both formats coexist)</li>
       <li>Page order read from <code>pages.json → pageOrder[]</code>; if absent, all <code>[pageName]/page.json</code> files are discovered by scanning</li>
       <li>Per-page metadata from <code>[pageName]/page.json</code> — <code>name</code>, <code>displayName</code>, <code>width</code>, <code>height</code></li>
       <li>Each visual lives at <code>[pageName]/visuals/[visualName]/visual.json</code> — type from <code>visual.visualType</code>, position from <code>position.{x,y,z,width,height,tabOrder}</code>, field bindings from <code>visual.query.queryState.[role].projections[].queryRef</code> (falls back to walking <code>field</code> when <code>queryRef</code> is missing)</li>
