@@ -196,6 +196,35 @@ body {
 .view.active { display: block; }
 .view-inner { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
 
+/* ── Loading overlay ── */
+.loading-overlay {
+  position: fixed; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(20, 30, 24, 0.55);
+  backdrop-filter: blur(2px);
+  z-index: 50;
+}
+.loading-box {
+  display: flex; flex-direction: column; align-items: center; gap: 16px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 28px 40px;
+  box-shadow: 0 10px 40px rgba(0,0,0,0.25);
+}
+.loading-spinner {
+  width: 38px; height: 38px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading-text {
+  font-family: var(--mono); font-size: 13px; color: var(--text-2);
+  text-align: center; max-width: 320px;
+}
+
 /* ── Empty state ── */
 .empty-state {
   position: absolute; inset: 0;
@@ -1058,6 +1087,13 @@ tr.row-unused td:first-child { font-style: italic; }
       <p>Or click <strong>Load PBIP Folder</strong> above to pick a folder. Your Power BI project's tables, measures, sources, relationships and pages will be parsed and explored locally — nothing leaves this page.</p>
       <button class="btn primary" id="loadBtn2">⤓ Pick a folder</button>
       <div class="hint">Expected structure: <code>MyReport.pbip</code> + <code>MyReport.Report/</code> + <code>MyReport.SemanticModel/</code></div>
+    </div>
+  </div>
+
+  <div class="loading-overlay" id="loadingOverlay" style="display:none">
+    <div class="loading-box">
+      <div class="loading-spinner"></div>
+      <div class="loading-text" id="loadingText">Loading…</div>
     </div>
   </div>
 
@@ -2053,25 +2089,29 @@ async function parsePbirReport(byPath, pagesRoot) {
     }
   }
 
-  // 3. For each page, read page.json + walk visuals/*/visual.json
+  // 3. For each page, read page.json + walk visuals/*/visual.json.
+  //    Files are read in PARALLEL (Promise.all) — a PBIR report can have hundreds of
+  //    visual.json files and reading them one-by-one with sequential awaits is slow.
+  //    Pages are processed concurrently too; we re-sort by pageOrder at the end since
+  //    Promise.all completion order isn't guaranteed.
   const pages = [];
-  for (const pageName of pageNames) {
+  await Promise.all(pageNames.map(async (pageName, order) => {
     const pageJsonKey = `${pagesRoot}/${pageName}/page.json`;
-    if (!byPath[pageJsonKey]) continue;
+    if (!byPath[pageJsonKey]) return;
     let pageJson;
     try {
-      const t = await byPath[pageJsonKey].text();
-      pageJson = JSON.parse(t);
+      pageJson = JSON.parse(await byPath[pageJsonKey].text());
       allJson.push(pageJson);
-    } catch (e) { continue; }
+    } catch (e) { return; }
 
     const visualPrefix = `${pagesRoot}/${pageName}/visuals/`;
     const visualKeys = Object.keys(byPath).filter(k =>
       k.startsWith(visualPrefix) && k.endsWith('/visual.json'));
+    const visualTexts = await Promise.all(visualKeys.map(vk => byPath[vk].text().catch(() => null)));
     const visuals = [];
-    for (const vk of visualKeys) {
+    for (const t of visualTexts) {
+      if (t == null) continue;
       try {
-        const t = await byPath[vk].text();
         const vJson = JSON.parse(t);
         allJson.push(vJson);
         visuals.push(parsePbirVisual(vJson));
@@ -2079,13 +2119,17 @@ async function parsePbirReport(byPath, pagesRoot) {
     }
 
     pages.push({
+      _order: order,
       name: pageJson.name || pageName,
       displayName: pageJson.displayName || pageJson.name || pageName,
       width: Math.round(pageJson.width || 0),
       height: Math.round(pageJson.height || 0),
       visuals,
     });
-  }
+  }));
+  // Restore the intended page order, then drop the temporary sort key
+  pages.sort((a, b) => a._order - b._order);
+  for (const p of pages) delete p._order;
 
   // 4. Run the report-references walker on EACH parsed file and union the results.
   //    Do NOT concatenate the file texts — multiple JSON documents joined together aren't
@@ -2405,6 +2449,21 @@ function countUnused() {
 /* ═══════════════════════════════════════════════════════════════
    FILE LOADING
    ═══════════════════════════════════════════════════════════════ */
+
+/* Loading overlay helpers. PBIR projects can contain hundreds of small JSON files,
+   so loading is no longer instant — show a spinner with progress text. */
+function showLoading(msg) {
+  if (App.els.loadingText && msg) App.els.loadingText.textContent = msg;
+  if (App.els.loadingOverlay) App.els.loadingOverlay.style.display = 'flex';
+}
+function setLoadingText(msg) { if (App.els.loadingText) App.els.loadingText.textContent = msg; }
+function hideLoading() { if (App.els.loadingOverlay) App.els.loadingOverlay.style.display = 'none'; }
+/* Resolve after the browser has had a chance to paint — so the overlay/text is
+   actually visible before we start a heavy synchronous step (e.g. buildUsageIndex). */
+function nextPaint() {
+  return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+}
+
 async function processFiles(fileList) {
   // fileList: array of File objects with relative paths (via webkitRelativePath or assembled)
   const byPath = {};
@@ -2421,6 +2480,10 @@ async function processFiles(fileList) {
   const smRoot = smKey.replace(/\/definition\/model\.tmdl$/, '');
   const projectName = smRoot.split('/').pop().replace(/\.SemanticModel$/, '');
   App.state.projectName = projectName;
+
+  showLoading('Reading files…');
+  await nextPaint();  // let the overlay paint before the heavy work starts
+  try {
 
   // Read relevant files
   const readText = async (path) => {
@@ -2439,15 +2502,16 @@ async function processFiles(fileList) {
   }
   App.state.modelAnnotations = annotations;
 
-  // Parse all table files
+  // Parse all table files — read them in PARALLEL (Promise.all) rather than awaiting
+  // each sequentially; large models have many table files and sequential reads are slow.
+  setLoadingText('Parsing tables…');
   const tables = [];
   const tablePathRe = new RegExp(`^${escRe(smRoot)}/definition/tables/.+\\.tmdl$`);
-  for (const path of Object.keys(byPath)) {
-    if (tablePathRe.test(path)) {
-      const text = await byPath[path].text();
-      const t = parseTable(text);
-      if (t) tables.push(t);
-    }
+  const tablePaths = Object.keys(byPath).filter(p => tablePathRe.test(p));
+  const tableTexts = await Promise.all(tablePaths.map(p => byPath[p].text()));
+  for (const text of tableTexts) {
+    const t = parseTable(text);
+    if (t) tables.push(t);
   }
   tables.sort((a,b) => a.name.localeCompare(b.name));
   App.state.tables = tables;
@@ -2514,6 +2578,7 @@ async function processFiles(fileList) {
   }
   const legacyKey = Object.keys(byPath).find(k => /\.Report\/report\.json$/.test(k));
   if (pbirPagesRoot) {
+    setLoadingText('Parsing report pages…');
     const { pages, references } = await parsePbirReport(byPath, pbirPagesRoot);
     App.state.pages = pages;
     App.state.reportReferences = references;
@@ -2526,7 +2591,10 @@ async function processFiles(fileList) {
     App.state.reportReferences = new Set();
   }
 
-  // Build usage index (needs tables + relationships + pages + reportReferences)
+  // Build usage index (needs tables + relationships + pages + reportReferences).
+  // This is the heaviest synchronous step, so paint the overlay text first.
+  setLoadingText('Analyzing usage…');
+  await nextPaint();
   buildUsageIndex();
 
   // Hide empty state, render
@@ -2536,6 +2604,13 @@ async function processFiles(fileList) {
   updateCounts();
   renderAll();
   showToast(`Loaded ${tables.length} tables, ${countAllMeasures()} measures, ${App.state.relationships.length} relationships`, 'success');
+
+  } catch (err) {
+    console.error('Failed to load PBIP:', err);
+    showToast('Failed to load: ' + (err && err.message ? err.message : err), 'error');
+  } finally {
+    hideLoading();
+  }
 }
 
 function countAllMeasures() {
@@ -5015,6 +5090,8 @@ function applyExportPreset(name) {
    ═══════════════════════════════════════════════════════════════ */
 function init() {
   App.els.emptyState = document.getElementById('emptyState');
+  App.els.loadingOverlay = document.getElementById('loadingOverlay');
+  App.els.loadingText = document.getElementById('loadingText');
   App.els.projectName = document.getElementById('projectName');
   App.els.folderInput = document.getElementById('folderInput');
   App.els.loadBtn = document.getElementById('loadBtn');
