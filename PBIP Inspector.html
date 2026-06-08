@@ -1047,6 +1047,7 @@ tr.row-unused td:first-child { font-style: italic; }
   <div class="nav-tab" data-view="pages">Pages <span class="count" id="cPages">0</span></div>
   <div class="nav-tab" data-view="unused">Unused <span class="count" id="cUnused">0</span></div>
   <div class="nav-tab" data-view="notes">Notes</div>
+  <div class="nav-tab" data-view="export">Export</div>
 </nav>
 
 <main class="main">
@@ -1068,6 +1069,7 @@ tr.row-unused td:first-child { font-style: italic; }
   <div class="view" id="view-pages" style="padding:0"><div id="pagesContent" style="height:100%"></div></div>
   <div class="view" id="view-unused"><div class="view-inner" id="unusedContent"></div></div>
   <div class="view" id="view-notes"><div class="view-inner" id="notesContent"></div></div>
+  <div class="view" id="view-export"><div class="view-inner" id="exportContent"></div></div>
 
   <div class="search-results-panel" id="searchPanel"></div>
 </main>
@@ -1101,6 +1103,11 @@ const App = {
     measureFilter: '',
     searchTerm: '',
     showHidden: false,    // include hidden / LocalDateTable_* / DateTableTemplate* in displays?
+    exportOpts: {         // which sections the Export (Markdown) tab includes
+      summary: true, sources: true, tables: true, measures: true, calcGroups: true,
+      relationships: true, pages: true, unused: true,
+      includeM: true, includeHidden: false, aiPreamble: false,
+    },
   },
   els: {},
 };
@@ -4131,7 +4138,17 @@ function renderNotes() {
     </ul>
     <p>Microsoft docs: <a href="https://learn.microsoft.com/en-us/power-bi/developer/projects/projects-report" target="_blank">PBIP Report folder</a> · <a href="https://github.com/microsoft/json-schemas/tree/main/fabric/item/report/definition" target="_blank">PBIR JSON schemas</a></p>
 
-    <h2>12. Known limitations / TODO</h2>
+    <h2>12. Export (Markdown) tab</h2>
+    <p>Generates a single Markdown document describing the whole model + report, for pasting into an AI chat, sharing, or quick copy (e.g. grab every measure at once).</p>
+    <ul>
+      <li><strong>Section toggles</strong> — Summary, Data sources, Tables &amp; columns, Measures (DAX), Calc groups, Relationships, Report pages, Unused</li>
+      <li><strong>Detail toggles</strong> — include M / Power Query code, include hidden tables, add an AI-prompt preamble line</li>
+      <li><strong>Presets</strong> — <em>Everything</em>, <em>Measures only</em>, <em>Schema only</em>, <em>AI prompt</em> (preamble + everything)</li>
+      <li><strong>Copy</strong> uses the async Clipboard API with a <code>document.execCommand('copy')</code> fallback for <code>file://</code>; <strong>Download</strong> writes a <code>&lt;projectName&gt;.md</code> via a Blob URL</li>
+      <li>Built by <code>buildMarkdownExport(opts)</code> from <code>App.state</code> — same data the other tabs render, so it always reflects the loaded model (legacy or PBIR)</li>
+    </ul>
+
+    <h2>13. Known limitations / TODO</h2>
     <ul>
       <li><strong>Function definitions in M</strong> (<code>let f = (x) => ...</code>) — not traced as a source. A table that calls a custom function won't be classified.</li>
       <li><strong>Parameters / variables</strong> as SQL — if the SQL is built at runtime via <code>"SELECT * FROM " &amp; TableNameParam</code>, only the literal pieces are extracted.</li>
@@ -4141,7 +4158,7 @@ function renderNotes() {
       <li><strong>Bookmarks, themes, drill-through</strong> in the report — not parsed.</li>
     </ul>
 
-    <h2>13. Is it offline-safe?</h2>
+    <h2>14. Is it offline-safe?</h2>
     <ul>
       <li><strong>D3 v7 is embedded inline</strong> in the file (~280 KB inside a <code>&lt;script&gt;</code> block at the top) — no CDN call needed at runtime.</li>
       <li>Only network call on page load: <code>https://fonts.googleapis.com/css2?...</code> — fonts only, no data. Falls back to system fonts if blocked.</li>
@@ -4150,7 +4167,7 @@ function renderNotes() {
       <li>To make it 100% network-free, remove the Google Fonts <code>&lt;link&gt;</code> in <code>&lt;head&gt;</code> and the page falls back to system sans-serif. (D3 is already in the file, so it needs no network.)</li>
     </ul>
 
-    <h2>14. How to extend</h2>
+    <h2>15. How to extend</h2>
     <ol>
       <li><strong>Add a new connector:</strong> add a pattern to the <code>patterns</code> array in <code>fromM</code>, plus a badge color in the CSS <code>.source-type-badge.&lt;type&gt;</code> rule.</li>
       <li><strong>Add a new M escape:</strong> extend <code>unescapeM()</code> — the dispatch is a simple if/else on the code name.</li>
@@ -4672,8 +4689,311 @@ function renderActive() {
   else if (v === 'pages') renderPages();
   else if (v === 'unused') renderUnused();
   else if (v === 'notes') renderNotes();
+  else if (v === 'export') renderExport();
 }
 function renderAll() { renderActive(); }
+
+/* ═══════════════════════════════════════════════════════════════
+   RENDERING — EXPORT (Markdown) tab
+   Generates a single Markdown document summarizing the whole model +
+   report, suitable for pasting into an AI chat, sharing, or quick copy.
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Escape a value for use inside a Markdown table cell. */
+function mdCell(v) {
+  return String(v == null ? '' : v).replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+}
+
+/* Build the full Markdown document from current state + the given options. */
+function buildMarkdownExport(o) {
+  const s = App.state;
+  const L = [];
+  const push = (...xs) => { for (const x of xs) L.push(x); };
+
+  // Map each table to its data source (App.state.sources[].queries holds table names)
+  const tableToSource = {};
+  for (const src of s.sources) for (const tn of src.queries) tableToSource[tn] = src;
+
+  const tables = o.includeHidden ? s.tables : visibleTables();
+
+  if (o.aiPreamble) {
+    push('> **Context for an AI assistant:** Below is a complete export of a Power BI semantic model'
+       + ' (and its report) generated by PBIP Inspector. Use it as reference context when answering'
+       + ' questions or proposing changes. It documents tables, columns, measures (DAX), relationships,'
+       + ' data sources, and report pages.');
+    push('');
+  }
+
+  push(`# ${s.projectName || 'Power BI Model'} — Documentation`);
+  push('');
+  push(`_Generated by [PBIP Inspector](https://sharathpyata.github.io/pbip-inspector/) on ${new Date().toISOString().slice(0, 10)}._`);
+  push('');
+
+  // ── Summary ──
+  if (o.summary) {
+    const hidden = countHiddenTables();
+    push('## Summary');
+    push('');
+    push('| Metric | Count |', '|---|---|');
+    push(`| Tables | ${visibleTables().length}${hidden ? ` (+${hidden} hidden)` : ''} |`);
+    push(`| Measures | ${countAllMeasures()} |`);
+    push(`| Columns | ${countAllColumns()} |`);
+    push(`| Relationships | ${s.relationships.length} |`);
+    push(`| Data sources | ${s.sources.length} |`);
+    push(`| Report pages | ${s.pages.length} (${s.pages.reduce((a, p) => a + p.visuals.length, 0)} visuals) |`);
+    push('');
+    const ann = s.modelAnnotations || {};
+    const meta = [];
+    if (ann.PBIDesktopVersion) meta.push(`- **Power BI Desktop:** ${ann.PBIDesktopVersion}`);
+    if (ann.__PBI_TimeIntelligenceEnabled) meta.push(`- **Time intelligence:** ${ann.__PBI_TimeIntelligenceEnabled === '1' ? 'enabled' : 'disabled'}`);
+    if (ann.PBI_ProTooling) meta.push(`- **Tooling:** ${ann.PBI_ProTooling}`);
+    if (meta.length) { push('**Model metadata**', ''); push(...meta); push(''); }
+  }
+
+  // ── Data sources ──
+  if (o.sources && s.sources.length) {
+    push('## Data sources', '');
+    for (const src of s.sources) {
+      push(`### ${src.name} \`${src.type}\``, '');
+      if (src.server) push(`- **Server:** ${src.server}`);
+      if (src.queries.length) push(`- **Tables (${src.queries.length}):** ${src.queries.join(', ')}`);
+      push('');
+      if (o.includeM && src.expressions && src.expressions.length) {
+        for (const e of src.expressions) {
+          push(`**Expression: ${e.name}**`, '', '```m', String(e.m || '').trim(), '```', '');
+        }
+      }
+    }
+  }
+
+  // ── Tables & columns (schema; measures get their own section) ──
+  if (o.tables) {
+    push('## Tables', '');
+    for (const t of tables) {
+      const kind = TABLE_KIND_LABEL[tableKind(t)] || 'Table';
+      const flags = [];
+      if (t.isHidden || isSystemTable(t.name)) flags.push('hidden');
+      if (t.isPrivate) flags.push('private');
+      const src = tableToSource[t.name];
+      push(`### ${t.name}`, '');
+      push(`- **Kind:** ${kind}${flags.length ? ` _(${flags.join(', ')})_` : ''}`);
+      if (src) push(`- **Source:** ${src.name} (${src.type})`);
+      if (t.description) push(`- **Description:** ${mdCell(t.description)}`);
+      if (t.hierarchies && t.hierarchies.length) push(`- **Hierarchies:** ${t.hierarchies.join(', ')}`);
+      push('');
+      if (t.columns.length) {
+        push(`**Columns (${t.columns.length})**`, '');
+        push('| Column | Type | Calc | Folder | Notes |', '|---|---|---|---|---|');
+        for (const c of t.columns) {
+          const notes = [];
+          if (c.isHidden) notes.push('hidden');
+          if (o.unused && usageStatus(`${t.name}.${c.name}`) === 'unused') notes.push('unused');
+          if (c.sortByColumn) notes.push(`sortBy: ${c.sortByColumn}`);
+          push(`| ${mdCell(c.name)} | ${mdCell(c.dataType || '')} | ${c.calcDax ? 'yes' : ''} | ${mdCell(c.displayFolder || '')} | ${mdCell(notes.join(', '))} |`);
+        }
+        push('');
+        // Calculated-column DAX
+        const calcCols = t.columns.filter(c => c.calcDax);
+        if (calcCols.length) {
+          for (const c of calcCols) {
+            push(`_Calculated column_ **${c.name}**`, '```dax', String(c.calcDax).trim(), '```', '');
+          }
+        }
+      }
+      // Partition M
+      if (o.includeM && t.partitionSource && t.partitionKind === 'm') {
+        push('**Partition (Power Query M)**', '```m', String(t.partitionSource).trim(), '```', '');
+      }
+    }
+  }
+
+  // ── Measures (flat, grouped by table — the "copy all measures" section) ──
+  if (o.measures) {
+    const withMeas = tables.filter(t => t.measures && t.measures.length);
+    if (withMeas.length) {
+      push('## Measures', '');
+      for (const t of withMeas) {
+        push(`### ${t.name}`, '');
+        for (const m of t.measures) {
+          const folder = m.displayFolder ? ` _(${m.displayFolder})_` : '';
+          push(`#### ${m.name}${folder}`);
+          if (m.formatString) push(`Format: \`${m.formatString}\``);
+          push('```dax', String(m.dax || '').trim(), '```', '');
+        }
+      }
+    }
+  }
+
+  // ── Calculation groups ──
+  if (o.calcGroups) {
+    const groups = tables.filter(t => t.isCalcGroup && t.calcItems && t.calcItems.length);
+    if (groups.length) {
+      push('## Calculation groups', '');
+      for (const t of groups) {
+        push(`### ${t.name}`, '');
+        if (t.calcGroupPrecedence != null && t.calcGroupPrecedence !== '') push(`- **Precedence:** ${t.calcGroupPrecedence}`, '');
+        for (const ci of t.calcItems) {
+          push(`#### ${ci.name}`, '```dax', String(ci.dax || '').trim(), '```', '');
+        }
+      }
+    }
+  }
+
+  // ── Relationships ──
+  if (o.relationships && s.relationships.length) {
+    push('## Relationships', '');
+    push('| From | To | Cross-filter |', '|---|---|---|');
+    for (const r of s.relationships) {
+      const xf = r.crossFiltering === 'bothDirections' ? 'both' : 'single';
+      push(`| ${mdCell(`${r.fromTable}[${r.fromColumn}]`)} | ${mdCell(`${r.toTable}[${r.toColumn}]`)} | ${xf} |`);
+    }
+    push('');
+  }
+
+  // ── Report pages ──
+  if (o.pages && s.pages.length) {
+    push('## Report pages', '');
+    for (const p of s.pages) {
+      const dim = p.width && p.height ? ` _(${p.width}×${p.height})_` : '';
+      push(`### ${p.displayName || p.name}${dim}`, '');
+      if (!p.visuals.length) { push('_No visuals._', ''); continue; }
+      for (const v of p.visuals) {
+        const fieldList = v.fields && v.fields.length ? v.fields.map(f => f.ref).join(', ') : '_no field bindings_';
+        push(`- **${v.type}** — ${mdCell(fieldList)}`);
+      }
+      push('');
+    }
+  }
+
+  // ── Unused ──
+  if (o.unused) {
+    const uCols = [], uMeas = [];
+    const visSet = new Set(visibleTables().map(t => t.name));
+    if (s.usage) {
+      for (const [key, e] of Object.entries(s.usage.byKey)) {
+        if (!visSet.has(e.table)) continue;
+        if (usageStatus(key) !== 'unused') continue;
+        (e.kind === 'column' ? uCols : uMeas).push(`${e.table}[${e.name}]`);
+      }
+    }
+    push('## Unused (no references found)', '');
+    push(`**Unused columns (${uCols.length}):** ${uCols.length ? uCols.join(', ') : '_none_'}`, '');
+    push(`**Unused measures (${uMeas.length}):** ${uMeas.length ? uMeas.join(', ') : '_none_'}`, '');
+  }
+
+  return L.join('\n');
+}
+
+const EXPORT_SECTIONS = [
+  ['summary', 'Summary'], ['sources', 'Data sources'], ['tables', 'Tables & columns'],
+  ['measures', 'Measures (DAX)'], ['calcGroups', 'Calc groups'], ['relationships', 'Relationships'],
+  ['pages', 'Report pages'], ['unused', 'Unused'],
+];
+const EXPORT_DETAILS = [
+  ['includeM', 'Include M / Power Query code'], ['includeHidden', 'Include hidden tables'],
+  ['aiPreamble', 'Add AI-prompt preamble'],
+];
+
+function renderExport() {
+  const c = App.els.exportContent;
+  if (!App.state.tables.length) {
+    c.innerHTML = '<div class="card"><div class="card-body" style="color:var(--text-3)">Load a PBIP folder first.</div></div>';
+    return;
+  }
+  const o = App.state.exportOpts;
+  const md = buildMarkdownExport(o);
+  const lines = md.split('\n').length;
+
+  const toggleHtml = (key, label) => `
+    <label class="usage-toggle ${o[key] ? 'active' : ''}">
+      <input type="checkbox" data-export-opt="${key}" ${o[key] ? 'checked' : ''}> ${label}
+    </label>`;
+
+  c.innerHTML = `
+    <div style="color:var(--text-2);font-size:13px;margin-bottom:14px;line-height:1.55">
+      A single Markdown document describing the whole model. Use it as an <strong>AI prompt</strong>,
+      a quick reference, or to <strong>copy all measures</strong> at once. Toggle sections below, then copy or download.
+    </div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+      <button class="btn small" data-export-preset="everything">Everything</button>
+      <button class="btn small" data-export-preset="measures">Measures only</button>
+      <button class="btn small" data-export-preset="schema">Schema only</button>
+      <button class="btn small" data-export-preset="ai">AI prompt</button>
+    </div>
+
+    <div class="usage-toolbar" style="flex-wrap:wrap;gap:8px">
+      ${EXPORT_SECTIONS.map(([k, l]) => toggleHtml(k, l)).join('')}
+    </div>
+    <div class="usage-toolbar" style="flex-wrap:wrap;gap:8px;margin-top:8px">
+      ${EXPORT_DETAILS.map(([k, l]) => toggleHtml(k, l)).join('')}
+    </div>
+
+    <div style="display:flex;align-items:center;gap:10px;margin:14px 0 8px">
+      <button class="btn" id="exportCopyBtn">📋 Copy Markdown</button>
+      <button class="btn" id="exportDownloadBtn">⬇ Download .md</button>
+      <span id="exportCopyStatus" style="font-family:var(--mono);font-size:12px;color:var(--green-dark)"></span>
+      <span style="margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--text-3)">${md.length.toLocaleString()} chars · ${lines.toLocaleString()} lines</span>
+    </div>
+
+    <textarea id="exportPreview" readonly spellcheck="false"
+      style="width:100%;height:55vh;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:12px;line-height:1.5;padding:12px;resize:vertical;outline:none;white-space:pre"></textarea>
+  `;
+
+  // Put the markdown into the textarea via .value (textContent would HTML-decode entities)
+  const ta = document.getElementById('exportPreview');
+  if (ta) ta.value = md;
+
+  // Section / detail toggles
+  c.querySelectorAll('input[data-export-opt]').forEach(el => {
+    el.onchange = () => { App.state.exportOpts[el.dataset.exportOpt] = el.checked; renderExport(); };
+  });
+
+  // Presets
+  c.querySelectorAll('button[data-export-preset]').forEach(btn => {
+    btn.onclick = () => { applyExportPreset(btn.dataset.exportPreset); renderExport(); };
+  });
+
+  // Copy
+  const copyBtn = document.getElementById('exportCopyBtn');
+  const status = document.getElementById('exportCopyStatus');
+  if (copyBtn) copyBtn.onclick = async () => {
+    const text = document.getElementById('exportPreview').value;
+    let ok = false;
+    try { await navigator.clipboard.writeText(text); ok = true; } catch (e) {
+      // Fallback for file:// or older browsers — select the textarea and execCommand
+      try { const t = document.getElementById('exportPreview'); t.focus(); t.select(); ok = document.execCommand('copy'); t.setSelectionRange(0, 0); t.blur(); } catch (e2) {}
+    }
+    if (status) { status.textContent = ok ? '✓ Copied!' : 'Copy failed — select the text manually'; setTimeout(() => { if (status) status.textContent = ''; }, 2500); }
+  };
+
+  // Download
+  const dlBtn = document.getElementById('exportDownloadBtn');
+  if (dlBtn) dlBtn.onclick = () => {
+    const text = document.getElementById('exportPreview').value;
+    const safe = (App.state.projectName || 'pbip-model').replace(/[^\w.-]+/g, '_');
+    const blob = new Blob([text], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${safe}.md`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+}
+
+function applyExportPreset(name) {
+  const o = App.state.exportOpts;
+  const setAll = (v) => { for (const [k] of EXPORT_SECTIONS) o[k] = v; };
+  if (name === 'everything') {
+    setAll(true); o.includeM = true; o.includeHidden = false; o.aiPreamble = false;
+  } else if (name === 'measures') {
+    setAll(false); o.measures = true; o.calcGroups = true; o.includeM = false; o.aiPreamble = false;
+  } else if (name === 'schema') {
+    setAll(false); o.summary = true; o.tables = true; o.relationships = true; o.includeM = false; o.aiPreamble = false;
+  } else if (name === 'ai') {
+    setAll(true); o.includeM = true; o.aiPreamble = true;
+  }
+}
 
 /* ═══════════════════════════════════════════════════════════════
    INIT
@@ -4694,6 +5014,7 @@ function init() {
   App.els.pagesContent = document.getElementById('pagesContent');
   App.els.unusedContent = document.getElementById('unusedContent');
   App.els.notesContent = document.getElementById('notesContent');
+  App.els.exportContent = document.getElementById('exportContent');
   App.els.cSources = document.getElementById('cSources');
   App.els.cTables = document.getElementById('cTables');
   App.els.cMeasures = document.getElementById('cMeasures');

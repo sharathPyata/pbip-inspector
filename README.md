@@ -106,6 +106,7 @@ PBIP Inspector reads the `.SemanticModel/definition/*.tmdl` files for the data m
 | **Pages** | Master/detail like Tables. "📑 All Pages" shows the stacked list of every page; selecting a specific page shows just that page's visuals. A search box at the top filters by field or measure name (e.g. `Sales.Amount`, `Profit`) and highlights matches inline |
 | **Unused** | Columns and measures with no references in visuals, filters, DAX, or M code. Toggle to also show "structural-only" items (referenced only by relationships / sortBy / hierarchies) |
 | **Notes** | Self-documenting reference describing exactly what the parser supports. Open even without loading a folder to read it |
+| **Export** | Generates a single Markdown document of the whole model — paste it into an AI chat as context, share it, or copy all measures at once. Section toggles + presets (Everything / Measures only / Schema only / AI prompt), with copy-to-clipboard and download-`.md` buttons |
 
 ---
 
