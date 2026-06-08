@@ -1859,16 +1859,19 @@ function sourceGroupName(info) {
 }
 function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-// Strip Power Query M comments and string-literal CONTENTS so identifier-name searches
-// don't false-match against text that doesn't actually reference an identifier.
-// Behavior:
+// Strip Power Query M comments (and optionally string-literal CONTENTS) so identifier-name
+// searches don't false-match against ignorable lexical regions.
 //   - line comments (//...) → spaces (newline preserved)
 //   - block comments (slash-star ... star-slash) → spaces + preserved newlines
-//   - "string literal" → delimiters kept, contents replaced with spaces (length + newlines preserved)
 //   - #"Quoted Identifier" → preserved entirely (it's an identifier, not a string)
-// The output has the SAME length and line structure as the input, so character offsets
-// and line numbers remain aligned with the original.
-function stripMCommentsAndStrings(code) {
+//   - "string literal":
+//       * blankStrings = true  → delimiters kept, contents blanked. Use for TABLE-name
+//         (bare-identifier) matching, where a table name inside a string is NOT a real ref.
+//       * blankStrings = false → contents kept. Use for COLUMN-name matching, because M
+//         references columns AS string literals — e.g. Table.NestedJoin(A, {"Key"}, B, {"Key"}),
+//         Table.SelectColumns(t, {"Col"}), Table.RemoveColumns, Table.ExpandTableColumn.
+// The output keeps the same length + line structure as the input either way.
+function stripMNoise(code, blankStrings) {
   if (!code) return '';
   let out = '', i = 0, n = code.length;
   while (i < n) {
@@ -1891,13 +1894,13 @@ function stripMCommentsAndStrings(code) {
       while (i < stop) { out += (code[i] === '\n' ? '\n' : ' '); i++; }
       continue;
     }
-    // String literal — keep delimiters, blank contents
+    // String literal — keep delimiters; blank or keep contents per blankStrings
     if (code[i] === '"') {
       out += '"'; i++;
       while (i < n) {
-        if (code[i] === '"' && code[i+1] === '"') { out += '  '; i += 2; continue; }
+        if (code[i] === '"' && code[i+1] === '"') { out += blankStrings ? '  ' : '""'; i += 2; continue; }
         if (code[i] === '"') { out += '"'; i++; break; }
-        out += (code[i] === '\n' ? '\n' : ' ');
+        out += blankStrings ? (code[i] === '\n' ? '\n' : ' ') : code[i];
         i++;
       }
       continue;
@@ -2287,30 +2290,37 @@ function buildUsageIndex() {
     if (code.includes('#"' + cName + '"')) return true;      // quoted identifier
     return false;
   };
-  // Pre-strip each table's partition M of comments and string-literal contents, so that
-  // table/column name searches don't false-match text inside `// ...`, `/* ... */`, or
-  // `"..."`. The stripped output preserves length + newlines so all our regex/string
-  // searches behave identically — they just skip ignorable lexical regions.
-  const strippedM = new Map();
+  // Pre-strip each table's partition M two ways:
+  //   tableScan — comments AND string contents blanked → for TABLE-name (bare identifier)
+  //     matching, so a table name inside a comment or string doesn't false-match.
+  //   colScan   — comments blanked, STRING CONTENTS KEPT → for COLUMN-name matching, because
+  //     M references columns AS string literals (joins {"Key"}, SelectColumns {"Col"}, etc.).
+  const tableScanM = new Map();
+  const colScanM = new Map();
   for (const t of App.state.tables) {
-    if (t.partitionSource) strippedM.set(t.name, stripMCommentsAndStrings(t.partitionSource));
+    if (t.partitionSource) {
+      tableScanM.set(t.name, stripMNoise(t.partitionSource, true));
+      colScanM.set(t.name, stripMNoise(t.partitionSource, false));
+    }
   }
 
   let mChanged = true, mIter = 0;
   while (mChanged && mIter < 50) {
     mChanged = false; mIter++;
     for (const sourceT of App.state.tables) {
-      const sCode = strippedM.get(sourceT.name);
-      if (!sCode) continue;
+      const tableScan = tableScanM.get(sourceT.name);
+      const colScan = colScanM.get(sourceT.name);
+      if (!tableScan) continue;
       if (!tableIsUsed(sourceT.name)) continue;
       for (const refT of App.state.tables) {
         if (refT.name === sourceT.name) continue;
-        if (!tableNameInM(refT.name, sCode)) continue;
+        if (!tableNameInM(refT.name, tableScan)) continue;
 
         // Two cases:
         //   (a) Specific columns of refT are mentioned in the M (e.g. [Amount], "Region",
         //       #"My Col") — mark only those columns. The common case for joins,
-        //       SelectColumns, RemoveColumns, ExpandTableColumn, etc.
+        //       SelectColumns, RemoveColumns, ExpandTableColumn, etc. Column names are
+        //       matched against colScan (strings kept) since they appear AS string literals.
         //   (b) refT is referenced ONLY by bare table-name identifier AND has exactly one
         //       column — typical when refT's M returns a scalar value that Power BI auto-
         //       wraps as a single-column table, then consumed as a value elsewhere via
@@ -2319,7 +2329,7 @@ function buildUsageIndex() {
         //   are left alone — that pattern is vanishingly rare and would risk over-marking.
         let hasSpecificColumnRef = false;
         for (const c of refT.columns) {
-          if (columnNameInM(c.name, sCode)) { hasSpecificColumnRef = true; break; }
+          if (columnNameInM(c.name, colScan)) { hasSpecificColumnRef = true; break; }
         }
         const scalarLike = !hasSpecificColumnRef && refT.columns.length === 1;
         if (!hasSpecificColumnRef && !scalarLike) continue;  // multi-col bare ref → skip
@@ -2330,7 +2340,7 @@ function buildUsageIndex() {
           const cKey = `${refT.name}.${c.name}`;
           if (!byKey[cKey]) continue;
           if (byKey[cKey].direct.length || byKey[cKey].transitive.length) continue;
-          const match = scalarLike ? true : columnNameInM(c.name, sCode);
+          const match = scalarLike ? true : columnNameInM(c.name, colScan);
           if (match) {
             byKey[cKey].transitive.push(reason);
             mChanged = true;
@@ -4067,7 +4077,7 @@ function renderNotes() {
         <tr><td>Name in Select clauses</td><td><code>{ Column: {...}, Name: "Sales.Profit" }</code> — the <code>Name</code> string is parsed as a queryRef too</td><td>Direct</td></tr>
         <tr><td>Filters, sort, conditional formatting, drillthrough, etc.</td><td>all use the structured Column/Measure pattern above and are caught by the recursive walker, including when nested inside stringified JSON in <code>config</code> / <code>filters</code> / <code>dataTransforms</code></td><td>Direct</td></tr>
         <tr><td>DAX of a used measure or calculated column</td><td><code>Table[Col]</code>, <code>'Table'[Col]</code>, bare <code>[Measure]</code> in the DAX of any used measure <em>or used calculated column</em>. Calc-columns are DAX-defined just like measures, so their references propagate the same way.</td><td>Transitive (iterative)</td></tr>
-        <tr><td>M code of another used table</td><td>used table's partition M mentions another table by name <em>and</em> references a column via <code>"ColName"</code>, <code>[ColName]</code>, or <code>#"ColName"</code>. <strong>Scalar exception:</strong> if the referenced table has exactly one column and is referenced by bare name only, the sole column is marked used (see <strong>9.3</strong>). Comments and string-literal contents are stripped before searching.</td><td>Transitive (iterative)</td></tr>
+        <tr><td>M code of another used table</td><td>used table's partition M mentions another table by name <em>and</em> references a column via <code>"ColName"</code> (e.g. join keys / <code>SelectColumns</code>), <code>[ColName]</code>, or <code>#"ColName"</code>. <strong>Scalar exception:</strong> if the referenced table has exactly one column and is referenced by bare name only, the sole column is marked used (see <strong>9.3</strong>).</td><td>Transitive (iterative)</td></tr>
         <tr><td>Field parameter NAMEOF</td><td>calculated table's DAX has <code>NAMEOF('Table'[Col])</code>; when the parameter table is used in a visual, NAMEOF'd source fields are transitively used</td><td>Transitive</td></tr>
         <tr><td>Relationships</td><td><code>relationships.tmdl</code> from/to columns</td><td>Structural</td></tr>
         <tr><td>sortByColumn</td><td>column property pointing at another column (quoted names are unquoted before lookup)</td><td>Structural</td></tr>
@@ -4097,7 +4107,12 @@ function renderNotes() {
     </ul>
     <p>Detection requires the OTHER table's name to appear in the source table's M code AND the column name to appear as a string literal, <code>[Bracket]</code>, or <code>#"Quoted"</code> identifier. Both conditions must be met to mark the column as used.</p>
     <p><strong>Scalar-value references (1-column tables):</strong> if the referenced table has <em>exactly one column</em> and is referenced by bare name in the source's M with no specific column notation, that's treated as a scalar-value use — typical pattern is an M query that returns a single value (e.g. <code>PrevQuarter = PrevRow{0}[periodname]</code>) consumed elsewhere as <code>each [Period] = PreviousQuarter</code>. The sole column is marked transitively used. Multi-column tables referenced only by bare name are left alone to avoid over-counting.</p>
-    <p><strong>Comments and strings are stripped before searching</strong> — line comments (<code>//</code>), block comments (<code>/* … */</code>), and string-literal contents are replaced with spaces (preserving length + newlines) so a table name inside a comment or string can't false-match. Quoted identifiers (<code>#"…"</code>) are preserved because they really are identifiers.</p>
+    <p><strong>Two-pass lexical scrubbing before searching</strong> (so we don't false-match, but also don't miss legitimate refs):</p>
+    <ul>
+      <li><strong>Table-name matching</strong> scans M with comments <em>and</em> string-literal contents blanked — a bare table name inside a <code>// comment</code> or a <code>"string"</code> is not a real reference.</li>
+      <li><strong>Column-name matching</strong> scans M with comments blanked but <strong>string contents kept</strong> — because M references columns <em>as</em> string literals (join keys <code>{"Key"}</code>, <code>Table.SelectColumns(t, {"Col"})</code>, etc.). Blanking strings here would miss every column used in a join or column-list step.</li>
+      <li>Quoted identifiers (<code>#"…"</code>) are preserved in both passes — they really are identifiers.</li>
+    </ul>
     <p>Iterative: marking a column as used makes that column's table "used," which may trigger further M-reference propagation. Bounded at 50 iterations.</p>
 
     <h2>10. Relationships graph (D3 v7)</h2>
